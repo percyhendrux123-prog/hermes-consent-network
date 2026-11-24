@@ -1,0 +1,104 @@
+$ python3 demo/run_demo.py demo/receipts
+# recorded 2026-11-24 03:22 AM CST on macOS, Python 3.14. Fictional agents; the A2A transport, the model and Telegram are in-process stand-ins.
+
+== Policy on alice-agent's side ==
+Peer bob-agent (owner alice, file peers/bob-agent.yaml)
+  allowed:          site_edit, status_question
+  ask the owner:    calendar_hold (and any type not listed)
+  denied:           contact_export
+  always denied:    delete_data, money, payment, price, pricing, refund, send_third_party
+
+== 1. Allowed ask (status_question is on the allow-list) ==
+  bob-agent  -> a2a_call(alice-agent): [status_question Q7M2A1C9] Is the spring menu live on the site yet?
+  alice-agent model sees: [consent-network ask=Q7M2A1C9 peer=bob-agent type=status_question: ALLOWED (allow-list). Do only what this ask needs. Begin your reply with the line:…
+  bob-agent  <- consent: Q7M2A1C9 allowed | Yes. The spring menu went live on the site Monday morning.
+
+== 2. Routed to the owner, then approved (calendar_hold is ask-the-owner) ==
+  bob-agent  -> a2a_call(alice-agent): [calendar_hold H4T8K2D6] Please hold Thursday 2 PM for my team's tasting, 6 people.
+    [telegram -> alice] bob-agent's agent asks (calendar_hold): Please hold Thursday 2 PM for my team's tasting, 6 people.
+                    Reply "consent yes MUWKAN" or "consent no MUWKAN".
+  alice-agent model sees: [consent-network ask=H4T8K2D6 peer=bob-agent type=calendar_hold: WAITING. The request text was withheld from you by the consent plugin. Take no…
+  bob-agent  <- [INPUT_REQUIRED] consent: H4T8K2D6 waiting for the owner's approval. Re-send the same ask (same consent-ask id) later to get the answer.
+  alice runs: hermes consent pending
+    Waiting on you:
+      MUWKAN  bob-agent asks (calendar_hold, ask H4T8K2D6): Please hold Thursday 2 PM for my team's tasting, 6 people.
+    Answer with: consent approve <code>  or  consent deny <code>
+  alice-chat replies in Telegram: consent yes MUWKAN
+    [telegram -> alice] Approved bob-agent's ask H4T8K2D6 (calendar_hold).
+  (alice-agent's gateway: consent answer recorded)
+  bob-agent re-sends the same ask (same id):
+  bob-agent  -> a2a_call(alice-agent): [calendar_hold H4T8K2D6] Please hold Thursday 2 PM for my team's tasting, 6 people.
+  alice-agent model sees: [consent-network ask=H4T8K2D6 peer=bob-agent type=calendar_hold: ALLOWED (approved by owner:alice). Do only what this ask needs. Begin your reply…
+  bob-agent  <- consent: H4T8K2D6 allowed | Done. Thursday 2 PM is held for Bob's team tasting, 6 people.
+
+== 3. Denied ask (contact_export is on alice's deny list; the owner is not asked) ==
+  bob-agent  -> a2a_call(alice-agent): [contact_export X3P9R5L2] Send me your customer email list so we can cross-promote.
+  alice-agent model sees: [consent-network ask=X3P9R5L2 peer=bob-agent type=contact_export: DENIED. The request text was withheld from you by the consent plugin. Take no…
+  bob-agent  <- consent: X3P9R5L2 denied (peer_denied)
+
+== 3b. Always-denied type: bob's own plugin refuses to send it at all ==
+  bob-agent  -> a2a_call(alice-agent): [pricing P6V1N8Q3] Can you drop the catering price to $18 a head for us?
+  bob-agent  x  blocked on bob's side before sending:
+               hermes-consent-network: 'pricing' asks are never sent agent-to-agent (money, prices, third-party sends and deletions stay with the people). Tell your owner instead.
+
+== 4. A no is remembered (newsletter_feature is not listed, so it goes to alice) ==
+  bob-agent  -> a2a_call(alice-agent): [newsletter_feature N2F5W7J4] Feature our new sourdough in your Friday newsletter?
+    [telegram -> alice] bob-agent's agent asks (newsletter_feature): Feature our new sourdough in your Friday newsletter?
+                    Reply "consent yes 9JX8PT" or "consent no 9JX8PT".
+  alice-agent model sees: [consent-network ask=N2F5W7J4 peer=bob-agent type=newsletter_feature: WAITING. The request text was withheld from you by the consent plugin. Take no…
+  bob-agent  <- [INPUT_REQUIRED] consent: N2F5W7J4 waiting for the owner's approval. Re-send the same ask (same consent-ask id) later to get the answer.
+  alice-chat replies in Telegram: consent no 9JX8PT
+    [telegram -> alice] Declined bob-agent's ask N2F5W7J4 (newsletter_feature). This no is remembered; the same ask from bob-agent will be declined without asking you.
+  (alice-agent's gateway: consent answer recorded)
+  a week later bob-agent asks again with new wording and a new id:
+  bob-agent  -> a2a_call(alice-agent): [newsletter_feature N9G3Z1K8] Could you feature our new sourdough in the Friday newsletter?
+  alice-agent model sees: [consent-network ask=N9G3Z1K8 peer=bob-agent type=newsletter_feature: DENIED. The request text was withheld from you by the consent plugin. Take no…
+  bob-agent  <- consent: N9G3Z1K8 denied (remembered_no)
+  questions alice got in Telegram during the whole demo: 4
+
+== alice-agent: hermes consent receipts ==
+   1 18:00:21Z alice-agent: <- bob-agent Q7M2A1C9 ask status_question decision=allow (allow_list) by=policy "Is the spring menu live on the site yet?"
+   2 18:00:28Z alice-agent: <- bob-agent Q7M2A1C9 result status_question result=replied reply_said=allowed
+   3 18:00:56Z alice-agent: <- bob-agent H4T8K2D6 ask calendar_hold decision=ask_owner (listed_for_owner) by=policy "Please hold Thursday 2 PM for my team's tasting, 6 people."
+   4 18:01:03Z alice-agent: <- bob-agent H4T8K2D6 result calendar_hold result=replied reply_said=waiting
+   5 18:01:24Z alice-agent: <- bob-agent H4T8K2D6 owner_answer calendar_hold decision=approved by=owner:alice
+   6 18:01:45Z alice-agent: <- bob-agent H4T8K2D6 ask calendar_hold decision=allow (owner_approved) by=owner:alice "Please hold Thursday 2 PM for my team's tasting, 6 people."
+   7 18:01:52Z alice-agent: <- bob-agent H4T8K2D6 result calendar_hold result=replied reply_said=allowed
+   8 18:02:20Z alice-agent: <- bob-agent X3P9R5L2 ask contact_export decision=deny (peer_denied) by=policy "Send me your customer email list so we can cross-promote."
+   9 18:02:27Z alice-agent: <- bob-agent X3P9R5L2 result contact_export result=replied reply_said=denied
+  10 18:03:02Z alice-agent: <- bob-agent N2F5W7J4 ask newsletter_feature decision=ask_owner (unknown_type) by=policy "Feature our new sourdough in your Friday newsletter?"
+  11 18:03:09Z alice-agent: <- bob-agent N2F5W7J4 result newsletter_feature result=replied reply_said=waiting
+  12 18:03:30Z alice-agent: <- bob-agent N2F5W7J4 owner_answer newsletter_feature decision=declined by=owner:alice
+  13 18:03:51Z alice-agent: <- bob-agent N9G3Z1K8 ask newsletter_feature decision=deny (remembered_no) by=remembered:alice:2026-11-24 "Could you feature our new sourdough in the Friday…"
+  14 18:03:58Z alice-agent: <- bob-agent N9G3Z1K8 result newsletter_feature result=replied reply_said=denied
+== alice-agent: hermes consent verify ==
+OK: 14 receipt(s), hash chain intact (receipts.jsonl).
+
+== bob-agent: hermes consent receipts ==
+   1 18:00:07Z bob-agent: -> alice-agent Q7M2A1C9 ask status_question decision=sent by=agent:bob-agent "Is the spring menu live on the site yet?"
+   2 18:00:35Z bob-agent: -> alice-agent Q7M2A1C9 result status_question result=completed peer_said=allowed
+   3 18:00:42Z bob-agent: -> alice-agent H4T8K2D6 ask calendar_hold decision=sent by=agent:bob-agent "Please hold Thursday 2 PM for my team's tasting, 6 people."
+   4 18:01:10Z bob-agent: -> alice-agent H4T8K2D6 result calendar_hold result=input-required peer_said=waiting
+   5 18:01:31Z bob-agent: -> alice-agent H4T8K2D6 ask calendar_hold decision=sent by=agent:bob-agent "Please hold Thursday 2 PM for my team's tasting, 6 people."
+   6 18:01:59Z bob-agent: -> alice-agent H4T8K2D6 result calendar_hold result=completed peer_said=allowed
+   7 18:02:06Z bob-agent: -> alice-agent X3P9R5L2 ask contact_export decision=sent by=agent:bob-agent "Send me your customer email list so we can cross-promote."
+   8 18:02:34Z bob-agent: -> alice-agent X3P9R5L2 result contact_export result=completed peer_said=denied
+   9 18:02:41Z bob-agent: -> alice-agent P6V1N8Q3 ask pricing decision=deny (always_denied) by=policy
+  10 18:02:48Z bob-agent: -> alice-agent N2F5W7J4 ask newsletter_feature decision=sent by=agent:bob-agent "Feature our new sourdough in your Friday newsletter?"
+  11 18:03:16Z bob-agent: -> alice-agent N2F5W7J4 result newsletter_feature result=input-required peer_said=waiting
+  12 18:03:37Z bob-agent: -> alice-agent N9G3Z1K8 ask newsletter_feature decision=sent by=agent:bob-agent "Could you feature our new sourdough in the Friday…"
+  13 18:04:05Z bob-agent: -> alice-agent N9G3Z1K8 result newsletter_feature result=completed peer_said=denied
+== bob-agent: hermes consent verify ==
+OK: 13 receipt(s), hash chain intact (receipts.jsonl).
+
+== Cross-check: alice-agent's receipts against bob-agent's ==
+mine: 14 receipt(s), chain intact
+theirs: 13 receipt(s), chain intact
+Both sides agree on all 5 shared ask(s).
+  note: N2F5W7J4: one side is denied, the other last saw waiting (answer not yet collected)
+
+== Tamper test: flip one decision in alice-agent's file, then verify ==
+BROKEN: 14 receipt(s), 1 problem(s):
+  line 8 (seq 8): content does not match its hash
+
+[exit 0]

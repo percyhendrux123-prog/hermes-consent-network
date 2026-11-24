@@ -1,0 +1,50 @@
+name: hermes-consent-network
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: Consent rules for agent-to-agent asks over A2A. Each peer gets a YAML allow-list; anything outside it becomes one question to the named owner through hermes send, a no is remembered, money/prices/third-party sends/deletions are always refused, and every inbound and outbound ask writes a hash-chained receipt readable with `hermes consent receipts`. Denied and waiting asks reach the model with the request text withheld. No network calls of its own.
+author: Deploy Axiom
+license: MIT
+requires_hermes: ">=0.22.5"
+platforms: [macos, linux]
+provides_hooks:
+  - pre_gateway_dispatch
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call
+config_schema:
+  state_dir:
+    type: string
+    description: Where receipts.jsonl, pending.json and declines.json live. Default HERMES_HOME/plugins-state/hermes-consent-network.
+  peers_dir:
+    type: string
+    description: Directory of per-peer policy files (<peer>.yaml). Default <state_dir>/peers.
+  owner_notify_to:
+    type: string
+    description: hermes send target for owner questions when a peer policy has no notify_to (e.g. telegram).
+  owner_ids:
+    type: list
+    description: "platform:user_id entries allowed to answer with 'consent yes CODE' / 'consent no CODE' from chat."
+  side_name:
+    type: string
+    description: Name written as `side` on receipts. Default is the profile name.
+  pending_ttl_hours:
+    type: float
+    default: 24
+    description: Hours an unanswered ask waits before it is asked again.
+  remember_no_days:
+    type: float
+    default: 30
+    description: Days a declined ask stays declined without asking the owner. 0 turns memory off.
+  similarity:
+    type: float
+    default: 0.6
+    description: Token-Jaccard similarity (0-1) at which a new ask counts as one the owner already declined.
+  require_outbound_header:
+    type: bool
+    default: true
+    description: Block outbound asks that do not start with a consent-ask line.
+  store_summary:
+    type: bool
+    default: true
+    description: Keep a 120-character summary of each ask on its receipt. Off keeps only the text hash.
