@@ -25,7 +25,13 @@ from typing import Any, Callable, Dict, Optional
 
 from . import core
 
+try:  # agent identity needs `cryptography` (Ed25519); without it the plugin runs exactly as before
+    from . import identity as idm
+except ImportError:  # pragma: no cover
+    idm = None
+
 log = logging.getLogger(__name__)
+RANK = {"unsigned": 0, "signed": 1, "domain_verified": 2, "partner": 3}
 
 OUTBOUND_TOOLS = frozenset({"a2a_call", "a2a_orchestrate", "message_agent"})
 _PRIVACY_PREFIX = re.compile(r"^\s*\[A2A inbound[^\]]*\]\s*", re.S)
@@ -130,7 +136,9 @@ class ConsentNetwork:
             platform = _platform_of(source)
             if platform == "a2a":
                 peer = _text(getattr(source, "user_id", "")) or "unknown"
-                return self.inbound(peer, text)
+                # Set only by the transport that checked the HTTP signature (never parsed from the text).
+                ident = getattr(event, "agent_identity", None) or getattr(source, "agent_identity", None)
+                return self.inbound(peer, text, identity=ident)
             m = core.ANSWER_RE.match(text or "")
             if m and platform:
                 who = "%s:%s" % (platform, _text(getattr(source, "user_id", "")).lower())
@@ -171,19 +179,50 @@ class ConsentNetwork:
                 "the consent plugin. Take no action and call no tools for it. Reply with exactly this line "
                 "and nothing else:]\n%s" % (ask_id, peer, ask_type, state.upper(), line))
 
-    def inbound(self, peer: str, text: str) -> Dict[str, Any]:
+    def _resolve_peer(self, a2a_peer: str, ident: Any):
+        """(peer key, policy, level, identity receipt fields).
+
+        A verified signature names the peer by its domain. The domain's own policy file wins; then the
+        A2A credential's file; then the optional ``verified_default_policy`` file for any verified
+        domain. Listed by name = partner; the default lane = domain_verified."""
+        fields: Dict[str, Any] = {}
+        domain = ""
+        if idm is not None and isinstance(ident, idm.Identity):
+            fields = {k: v for k, v in ident.receipt_fields().items()
+                      if k in ("identity_label", "verified_domain", "signature_agent", "keyid", "request_sig_sha256")}
+            if not ident.rejected and ident.level in (idm.DOMAIN_VERIFIED, idm.PARTNER):
+                domain = ident.domain
+        if a2a_peer and a2a_peer != "unknown":
+            fields["a2a_peer"] = a2a_peer
+        peers = self.peers_dir()
+        if domain:
+            pol = core.load_policy(peers, domain)
+            if pol:
+                return domain, pol, "partner", fields
+        if a2a_peer and a2a_peer != "unknown":
+            pol = core.load_policy(peers, a2a_peer)
+            if pol:
+                fields.setdefault("identity_label", "a2a credential: %s" % a2a_peer)
+                return a2a_peer, pol, "partner", fields
+        if domain:
+            dflt = core.safe_name(self._cfg("verified_default_policy", ""))
+            pol = core.load_policy(peers, dflt) if dflt else None
+            return domain, pol, "domain_verified", fields
+        return a2a_peer or "unknown", None, "unsigned", fields
+
+    def inbound(self, peer: str, text: str, identity: Any = None) -> Dict[str, Any]:
         now = self._clock()
         body_full = _PRIVACY_PREFIX.sub("", text or "", count=1)
         ask_type, ask_id, body = core.parse_ask(body_full)
-        peer = core.safe_name(peer) or "unknown"
+        a2a_peer = core.safe_name(peer) or "unknown"
+        peer, policy, level, id_fields = self._resolve_peer(a2a_peer, identity)
         if not ask_id:
             ask_id = core.derived_ask_id(peer, ask_type, body)
         text_sha = core.sha256_text(core.normalize_text(body))
         summary = core.one_line(body)
-        policy = core.load_policy(self.peers_dir(), peer)
         owner = policy.owner if policy else ""
         base = dict(direction="in", ask_id=ask_id, peer=peer, owner=owner, ask_type=ask_type, summary=summary,
-                    text_sha256=text_sha)
+                    text_sha256=text_sha, identity=level, **id_fields)
 
         def deny(reason: str, decided_by: str, event: str = "ask") -> Dict[str, Any]:
             self._receipt(event=event, decision="deny", reason=reason, decided_by=decided_by, **base)
@@ -194,8 +233,14 @@ class ConsentNetwork:
             how = "allow-list" if decided_by == "policy" else "approved by %s" % decided_by
             return {"action": "rewrite", "text": self._banner(ask_id, peer, ask_type, owner, how) + body}
 
+        if idm is not None and isinstance(identity, idm.Identity) and identity.rejected:
+            # A signature was presented and failed (forged, replayed, expired, wrong domain): refuse outright.
+            return deny("signature_rejected:%s" % identity.reason.split(":")[0], "identity")
         if policy is None:
             return deny("no_policy_for_peer", "policy")
+        need = policy.required_level(ask_type)
+        if ask_type not in core.HARD_DENY and RANK.get(level, 0) < RANK.get(need, 99):
+            return deny("needs_%s" % need, "identity")
 
         # An answer the owner already gave to this exact ask wins over everything except the hard floor.
         # The answer is bound to the ask's text hash: a peer cannot reuse an approved id for new words.

@@ -221,6 +221,18 @@ class Policy:
         self.deny = _type_set(data.get("deny"))
         self.ask_owner = _type_set(data.get("ask_owner"))
         self.max_pending = int(coerce_float(data.get("max_pending"), 3) or 3)
+        # Trust floor per ask type (identity.py levels): unsigned < signed < domain_verified < partner.
+        # A partner is a peer the owner listed by name: an A2A token peer with a policy file, or a
+        # signature-verified domain with its own peers/<domain>.yaml.
+        self.require_partner = _type_set(data.get("require_partner"))
+        self.require_domain_verified = _type_set(data.get("require_domain_verified"))
+
+    def required_level(self, ask_type: str) -> str:
+        if ask_type in self.require_partner:
+            return "partner"
+        if ask_type in self.require_domain_verified:
+            return "domain_verified"
+        return "unsigned"
 
     def decide(self, ask_type: str) -> Tuple[str, str]:
         """(decision, reason). Order: hard floor, peer deny, allow, everything else to the owner."""
@@ -425,7 +437,10 @@ class Declines:
 
 # -- receipts -------------------------------------------------------------------------------
 RECEIPT_FIELDS = ("v", "seq", "ts", "side", "direction", "event", "ask_id", "peer", "owner", "ask_type",
-                  "summary", "text_sha256", "decision", "reason", "decided_by", "result", "detail")
+                  "summary", "text_sha256", "decision", "reason", "decided_by", "result", "detail",
+                  # agent identity (identity.py): who stands behind the peer, and the peer's signature hash
+                  "identity", "identity_label", "a2a_peer", "verified_domain", "signature_agent", "keyid",
+                  "request_sig_sha256")
 
 
 def _canonical(rec: Dict[str, Any]) -> bytes:

@@ -44,6 +44,9 @@ config_schema:
     type: bool
     default: true
     description: Block outbound asks that do not start with a consent-ask line.
+  verified_default_policy:
+    type: string
+    description: "Peer policy file used for any caller whose Web Bot Auth signature verifies for a domain that has no peers/<domain>.yaml of its own. Empty (default) = unlisted domains are refused."
   store_summary:
     type: bool
     default: true

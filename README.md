@@ -146,3 +146,35 @@ Stdlib only. PyYAML is used if present, otherwise a small built-in parser for th
 Part of a set of small consent and evidence plugins: [run-receipts](https://github.com/NousResearch/hermes-agent/pull/158864) (what a scheduled run actually did), [hermes-declines](https://github.com/NousResearch/hermes-agent/pull/158865) (a no to a scheduled job sticks; this plugin reuses that pattern for peer asks), [repeat-pause](https://github.com/NousResearch/hermes-agent/pull/158886), and the proactivity roadmap issue [#158538](https://github.com/NousResearch/hermes-agent/issues/158538).
 
 MIT.
+
+
+## Agent identity (Web Bot Auth)
+
+A2A tokens say "the owner gave this peer a key". They don't help when an agent you have never met
+shows up. `identity.py` adds the other half, on an IETF standard instead of a new format:
+**Web Bot Auth** (draft-ietf-webbotauth-httpsig-protocol), which is HTTP Message Signatures
+(RFC 9421) with the agent's public keys published at
+`https://<owner-domain>/.well-known/http-message-signatures-directory`.
+
+- The transport that terminates HTTP checks the signature (`identity.Verifier`) and attaches the
+  result to the inbound event as `agent_identity`. Text in a message can never set it.
+- A verified domain becomes the peer name: `peers/<domain>.yaml` applies (a **partner**: the owner
+  listed it). An unlisted verified domain gets `verified_default_policy` if you set one
+  (**domain_verified**). No signature and no A2A token: refused, as before.
+- Policies can demand a level per ask type: `require_partner: [calendar_hold]`,
+  `require_domain_verified: [...]`.
+- A signature that fails (forged key, wrong domain, replayed, expired, tampered) is refused outright,
+  and receipts record `identity`, `verified_domain`, `keyid` and the hash of the caller's signature.
+
+It proves which domain's owner stands behind an agent. It does not prove that owner is honest.
+Needs `cryptography`; without it the plugin behaves exactly as 0.1.0. Open question for Hermes core:
+the A2A server would need to run the check and set `agent_identity` on the event.
+The verifier also checks the directory response's own signatures (tag `http-message-signatures-directory`,
+over `"@authority";req`), as the draft requires of a verifier relying on the domain, so a copied key file on
+another host earns nothing.
+Tests: `tests/test_identity.py` (fictional domains, no network). With `cryptography` installed all 62 tests run:
+`uv run --with cryptography --with pyyaml python -m unittest discover -s . -p 'test_*.py' -t .`
+
+Working reference: the same `identity.py` runs in [agent-front-door](https://github.com/percyhendrux123-prog/agent-front-door),
+whose hosted door checks signatures live at https://axiom-front-door.percyhendrux123.workers.dev/mcp. Deploy Axiom's
+agents sign with the key published at https://deployaxiom.com/.well-known/http-message-signatures-directory.
