@@ -486,17 +486,131 @@ class TestReceipts(Base):
         bad[-1]["detail"]["peer_decision"] = "denied"
         self.assertEqual(len(core.compare_sides(self.receipts(), bad)[1]), 1)
 
+    def test_reply_hashes_must_match_when_both_present(self):
+        def result(reply):
+            return {"ask_id": "REPLY001", "event": "result",
+                    "detail": {"reply_sha256": core.sha256_text(reply)}}
+
+        mine = [result("Yes.")]
+        self.assertEqual(core.compare_sides(mine, [result("Yes.")]), (1, []))
+        self.assertEqual(core.compare_sides(mine, [{"ask_id": "REPLY001"}]), (1, []))
+        self.assertEqual(core.compare_sides(mine, [result("No.")]),
+                         (1, ["REPLY001: the two sides hashed different replies"]))
+
     def test_waiting_vs_final_is_a_note_not_a_mismatch(self):
-        mine = [{"ask_id": "W1", "decision": "declined"}]
-        theirs = [{"ask_id": "W1", "event": "result", "detail": {"peer_decision": "waiting"}}]
+        mine = [{"ask_id": "W1", "decision": "declined", "event": "result",
+                 "detail": {"reply_said": "denied", "reply_sha256": core.sha256_text("Declined.")}}]
+        theirs = [{"ask_id": "W1", "event": "result",
+                   "detail": {"peer_decision": "waiting", "reply_sha256": core.sha256_text("Waiting.")}}]
         self.assertEqual(core.compare_sides(mine, theirs), (1, []))
-        self.assertEqual(len(core.compare_notes(mine, theirs)), 1)
+        notes = core.compare_notes(mine, theirs)
+        self.assertIn("last saw waiting", notes[0])
+        self.assertIn("unsigned", notes[1])
+        del mine[0]["detail"]["reply_said"]
+        self.assertEqual(core.compare_sides(mine, theirs), (1, []))
+
+    def test_ambiguous_ask_ids_are_not_merged(self):
+        one = {"ask_id": "SCOPE001", "peer": "alice-agent", "direction": "out"}
+        two = dict(one, peer="carol-agent")
+        self.assertIn("ambiguous ask ID", core.compare_sides([one, two], [one])[1][0])
+
+    def test_records_from_the_same_direction_are_not_paired(self):
+        one = {"ask_id": "SCOPE002", "peer": "alice-agent", "direction": "out"}
+        shared, issues = core.compare_sides([one], [one])
+        self.assertEqual(shared, 0)
+        self.assertIn("directions are not reciprocal", issues[0])
+
+    def test_compare_reports_invalid_comparison_fields(self):
+        for field in ("ask_id", "ask_type", "text_sha256"):
+            with self.subTest(field=field):
+                shared, issues = core.compare_sides([], [dict({"ask_id": "MALFORM1"}, **{field: []})])
+                self.assertEqual(shared, 0)
+                self.assertEqual(issues, ["peer receipt line 1: malformed comparison fields"])
+
+    def test_no_signing_key_keeps_unsigned_receipts_comparable(self):
+        self._fill()
+        self.assertTrue(all("door_signature" not in r for r in self.receipts()))
+        peer = core.Receipts(self.dir / "caller", side="bob-agent")
+        peer.append(self.clock(), ask_id="EEEE0001", direction="out", peer="alice-agent", decision="sent")
+        comparison = self.p.command("compare %s" % peer.path)
+        self.assertIn("Both sides agree on all 1 shared ask(s).", comparison)
+        self.assertIn("1 peer receipt(s) unsigned", comparison)
+
+    def test_compare_rejects_a_broken_peer_chain(self):
+        path = self.dir / "broken.jsonl"
+        path.write_text("42\n")
+        comparison = self.p.command("compare %s" % path)
+        self.assertTrue(comparison.startswith("MISMATCH:"))
+        self.assertIn("theirs: broken receipt chain", comparison)
 
     def test_result_receipt_carries_peer_and_type(self):
         out = self.ask("status_question", "EEEE0006", "Is the patio open?")
         self.p.post_llm_call(user_message=out["text"], assistant_response="consent: EEEE0006 allowed", platform="a2a")
         r = self.receipts()[-1]
         self.assertEqual((r["peer"], r["ask_type"]), ("bob-agent", "status_question"))
+
+
+@unittest.skipIf(plugin_mod.idm is None, "cryptography not installed")
+class TestSignedReceipts(Base):
+    def setUp(self):
+        super().setUp()
+        idm = plugin_mod.idm
+        self.key = idm.AgentKey.generate()
+        path = self.dir / "test-signing-key"
+        self.key.to_file(path)
+        self.cfg["identity_key_file"] = str(path)
+        self.cfg["identity_key_url"] = idm.well_known_url("alice-agent.example")
+        self.directory = idm.directory([self.key])
+
+    def record_reply(self):
+        ask_id = "SIGNED01"
+        body = "Is the public event calendar up to date?"
+        self.ask("calendar_review", ask_id, body)
+        self.p.answer(self.code_for(ask_id), True)
+        prompt = self.ask("calendar_review", ask_id, body)["text"]
+        self.p.post_llm_call(user_message=prompt, assistant_response="consent: SIGNED01 allowed\nYes.", platform="a2a")
+        return self.receipts()
+
+    def test_configured_signing_covers_owner_answer_and_reply(self):
+        rows = self.record_reply()
+        self.assertEqual([r["event"] for r in rows], ["ask", "owner_answer", "ask", "result"])
+        self.assertTrue(core.verify_chain(rows)[0])
+        for row in rows:
+            self.assertEqual(row["door_signature"]["key_url"], self.cfg["identity_key_url"])
+            self.assertTrue(plugin_mod.idm.verify_receipt(row, self.directory))
+        caller = [{"ask_id": "SIGNED01", "direction": "out", "peer": "alice-agent"}]
+        self.assertEqual(core.compare_sides(caller, rows, peer_directory=self.directory), (1, []))
+
+    def test_compare_reports_invalid_signature_and_unavailable_key(self):
+        rows = self.record_reply()
+        self.assertIn("no trusted peer key directory", core.compare_sides(rows, rows)[1][0])
+        wrong_directory = plugin_mod.idm.directory([plugin_mod.idm.AgentKey.generate()])
+        shared, issues = core.compare_sides(rows, rows, peer_directory=wrong_directory)
+        self.assertEqual(shared, 0)
+        self.assertIn("invalid receipt signature", issues[0])
+        # A modified result no longer verifies against the signed record.
+        record = dict(rows[-1], detail={"reply_sha256": core.sha256_text("A different reply.")})
+        self.assertIn("invalid receipt signature", core.compare_sides(
+            rows, rows[:-1] + [record], peer_directory=self.directory)[1][0])
+
+    def test_cli_uses_the_operator_supplied_peer_key_directory(self):
+        import argparse
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        self.record_reply()
+        caller = core.Receipts(self.dir / "caller", side="bob-agent")
+        caller.append(self.clock(), ask_id="SIGNED01", direction="out", peer="alice-agent", decision="sent")
+        path = self.dir / "peer-directory.json"
+        path.write_text(json.dumps(self.directory))
+        parser = argparse.ArgumentParser()
+        cli.setup_parser(parser)
+        args = parser.parse_args(["compare", str(self.p.receipts().path), "--mine", str(caller.path),
+                                  "--peer-directory", str(path)])
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.handle(self.p, args), 0)
+        self.assertIn("Both sides agree on all 1 shared ask(s).", output.getvalue())
 
 
 class TestRegister(unittest.TestCase):

@@ -47,6 +47,12 @@ config_schema:
   verified_default_policy:
     type: string
     description: "Peer policy file used for any caller whose Web Bot Auth signature verifies for a domain that has no peers/<domain>.yaml of its own. Empty (default) = unlisted domains are refused."
+  identity_key_file:
+    type: string
+    description: Optional path to a local AgentKey Ed25519 private key for signing receipts. Requires cryptography.
+  identity_key_url:
+    type: string
+    description: Optional informational URL of the signing key directory. Compare never fetches this URL.
   store_summary:
     type: bool
     default: true

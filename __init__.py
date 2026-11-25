@@ -35,7 +35,7 @@ RANK = {"unsigned": 0, "signed": 1, "domain_verified": 2, "partner": 3}
 
 OUTBOUND_TOOLS = frozenset({"a2a_call", "a2a_orchestrate", "message_agent"})
 _PRIVACY_PREFIX = re.compile(r"^\s*\[A2A inbound[^\]]*\]\s*", re.S)
-_STATE_RE = re.compile(r"^\[[^\]\n]*\u00b7\s*([a-z-]+)\]", re.M)
+_STATE_RE = re.compile(r"^\[[^\]\r\n]*\u00b7[ \t]*([a-z-]+)\]\r?\n")
 PENDING_CALL_MAX = 200
 
 
@@ -124,7 +124,15 @@ class ConsentNetwork:
         try:
             if not self._store_summary():
                 fields.pop("summary", None)
-            self.receipts().append(self._clock(), **fields)
+            signer = None
+            key_file = _text(self._cfg("identity_key_file", ""))
+            if key_file:
+                if idm is None:
+                    raise RuntimeError("identity_key_file requires cryptography")
+                key = idm.AgentKey.from_file(Path(key_file).expanduser())
+                key_url = _text(self._cfg("identity_key_url", ""))
+                signer = lambda rec: idm.sign_receipt(key, key_url, rec)
+            self.receipts().append(self._clock(), signer=signer, **fields)
         except Exception as exc:  # a receipt failure must never decide an ask
             log.warning("hermes-consent-network: receipt not written: %s: %s", type(exc).__name__, exc)
 
@@ -429,8 +437,9 @@ class ConsentNetwork:
                     return
                 info = {"ask_id": ask_id, "peer": self._outbound_target(tool_name, args), "ask_type": ask_type}
             out = _text(result) if not isinstance(result, (dict, list)) else str(result)
-            said = core.REPLY_RE.search(out)
-            state = _STATE_RE.search(out)
+            state = _STATE_RE.match(out)
+            reply = out[state.end():] if state else out
+            said = core.REPLY_RE.search(reply)
             if out.startswith("Error"):
                 outcome = "error"
             else:
@@ -438,7 +447,8 @@ class ConsentNetwork:
             peer_decision = said.group("decision").lower() if said and said.group("id").upper() == info["ask_id"] else ""
             self._receipt(event="result", direction="out", ask_id=info["ask_id"], peer=info["peer"],
                           ask_type=info["ask_type"], result=outcome,
-                          detail={"peer_decision": peer_decision, "reply_sha256": core.sha256_text(out)})
+                          detail={"peer_decision": peer_decision,
+                                  "reply_sha256": core.sha256_text(reply) if reply and outcome != "error" else ""})
         except Exception as exc:
             log.warning("hermes-consent-network post_tool_call: %s: %s", type(exc).__name__, exc)
 

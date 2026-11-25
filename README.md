@@ -23,8 +23,8 @@ a2a_call  "consent-ask: calendar_hold id=H4T8K2D6
                                     -> pending, receipt (in, ask_owner)
                                     -> hermes send -t telegram ------------>  "bob-agent's agent asks
                                     model sees only: WAITING, text withheld      (calendar_hold): ...
-                    <--- [INPUT_REQUIRED] consent: H4T8K2D6 waiting             consent yes MUWKAN?"
-  post_tool_call -> receipt (out, waiting)                                  "consent yes MUWKAN"
+                    <--- [INPUT_REQUIRED] consent: H4T8K2D6 waiting             consent yes GULJB8?"
+  post_tool_call -> receipt (out, waiting)                                  "consent yes GULJB8"
                                     pre_gateway_dispatch (telegram, owner id) <--
                                     -> approved, receipt (owner_answer)
 a2a_call (same id, same text) ---->  approved and unused -> model sees the ask
@@ -65,9 +65,9 @@ max_pending: 3
 
 Any of these work:
 
-- In chat, from an id listed in `owner_ids`: `consent yes MUWKAN` or `consent no MUWKAN`. The message is consumed by the plugin and never reaches the agent.
-- In a session: `/consent approve MUWKAN`, `/consent deny MUWKAN`, `/consent pending`.
-- In a shell: `hermes consent approve MUWKAN`.
+- In chat, from an id listed in `owner_ids`: `consent yes GULJB8` or `consent no GULJB8`. The message is consumed by the plugin and never reaches the agent.
+- In a session: `/consent approve GULJB8`, `/consent deny GULJB8`, `/consent pending`.
+- In a shell: `hermes consent approve GULJB8`.
 
 The peer gets the answer the next time it sends the same ask. The waiting reply tells its agent to do that.
 
@@ -85,7 +85,7 @@ The peer gets the answer the next time it sends the same ask. The waiting reply 
 
 - `hermes consent receipts [--ask ID] [--peer NAME] [--last N] [--json]`
 - `hermes consent verify [path]` checks every line's hash, the link to the line before and the sequence. An edit, a deletion, a reorder or an insertion breaks it.
-- `hermes consent compare <other side's receipts.jsonl>` matches the two sides by ask id. It checks they hashed the same text, recorded the same type and reached the same decision.
+- `hermes consent compare <other side's receipts.jsonl> [--peer-directory <trusted-keys.json>]` matches the two sides by ask ID. It checks type, ask text hash, decision, and the reply hash when both sides have one. It verifies any peer receipt signatures against the supplied public key directory and notes unsigned peer receipts without rejecting them.
 
 Receipts store a 120-character summary of the ask (turn off with `store_summary: false` to keep only the hash), never the agent's reply (hash and length only), and no credentials.
 
@@ -106,6 +106,8 @@ Under `plugins.entries.hermes-consent-network.settings`:
 | `similarity` | 0.6 | how close new wording must be to a declined ask to count as the same |
 | `require_outbound_header` | true | block outbound asks with no `consent-ask` line |
 | `store_summary` | true | keep the 120-character summary on receipts |
+| `identity_key_file` | none | local Ed25519 key written by `identity.AgentKey.to_file`; opt-in receipt signing (requires `cryptography`) |
+| `identity_key_url` | none | optional public directory URL recorded as metadata; never fetched by `compare` |
 
 ## Demo: alice-agent and bob-agent
 
@@ -114,7 +116,7 @@ Under `plugins.entries.hermes-consent-network.settings`:
 | # | bob-agent asks | alice-agent's rule | what happens |
 |---|---|---|---|
 | 1 | `status_question`: is the spring menu live? | allow list | Alice's model answers. Nobody is pinged. |
-| 2 | `calendar_hold`: hold Thursday 2 PM | ask the owner | Alice gets one Telegram question. Her model sees only "waiting". She replies `consent yes MUWKAN`. Bob re-sends and gets the hold. |
+| 2 | `calendar_hold`: hold Thursday 2 PM | ask the owner | Alice gets one Telegram question. Her model sees only "waiting". She replies `consent yes GULJB8`. Bob re-sends and gets the hold. |
 | 3 | `contact_export`: send your customer list | deny list | Denied. Alice's model never sees the request. Alice isn't asked. |
 | 3b | `pricing`: drop the catering price | always denied | Bob's **own** plugin refuses to send it. |
 | 4 | `newsletter_feature`, twice, worded differently | not listed | The first one goes to Alice and she says no. A week later the reworded ask is denied from memory, with no second question. |
@@ -129,6 +131,7 @@ The pattern already runs between two real Hermes installs: an operator's agent a
 
 - Covers A2A asks that reach the gateway's normal inbound path (`pre_gateway_dispatch`). A2A agents served for another profile through `forward_to_owner` skip that hook today. That path is not covered (checked against source; not run live).
 - Approval comes back on the peer's next send of the same ask within `pending_ttl_hours`. After expiry, the ask is evaluated against current policy again. There is no push to the waiting peer yet. An older stored approval cannot release the ask if the original body may have been truncated; use a new ask ID.
+- A signed peer export requires a trusted local copy of that peer's public key directory. `compare` does not discover keys or fetch receipt-supplied URLs; unsigned receipts remain usable but do not authenticate the peer. Compare uses the latest substantive reply for each ID and reports ambiguous or nonreciprocal IDs rather than merging them. Use fresh IDs for new exchanges. Older exports may have hashed the caller's transport header along with the reply, causing a mismatch.
 - Ask types are declared by the asking agent. The plugin trusts the peer's identity (from A2A credentials), not its labels. That's why unknown and unlabeled asks go to the owner and labels can't open hard-denied types. A peer that mislabels a pricing ask as `status_question` gets an allowed status question. The model is told to do only what that type needs, and the receipt records the label it used.
 - Not installed in any live profile. `hermes plugins validate` passes. The `hermes consent` CLI registration was checked by validate and unit test, not run from an installed copy.
 
@@ -167,14 +170,14 @@ shows up. `identity.py` adds the other half, on an IETF standard instead of a ne
   and receipts record `identity`, `verified_domain`, `keyid` and the hash of the caller's signature.
 
 It proves which domain's owner stands behind an agent. It does not prove that owner is honest.
-Needs `cryptography`; without it the plugin behaves exactly as 0.1.0. Open question for Hermes core:
+Needs `cryptography`; without it the optional identity features are unavailable. Open question for Hermes core:
 the A2A server would need to run the check and set `agent_identity` on the event.
 The verifier also checks the directory response's own signatures (tag `http-message-signatures-directory`,
 over `"@authority";req`), as the draft requires of a verifier relying on the domain, so a copied key file on
 another host earns nothing.
-Tests: `tests/test_identity.py` (fictional domains, no network). With `cryptography` installed all 62 tests run:
+Tests: `tests/test_identity.py` and `tests/test_consent.py` (fictional domains, no network). To run the identity and signed-receipt tests as part of the full suite:
 `uv run --with cryptography --with pyyaml python -m unittest discover -s . -p 'test_*.py' -t .`
 
-Working reference: the same `identity.py` runs in [agent-front-door](https://github.com/percyhendrux123-prog/agent-front-door),
+Working reference: the Web Bot Auth verifier also runs in [agent-front-door](https://github.com/percyhendrux123-prog/agent-front-door),
 whose hosted door checks signatures live at https://axiom-front-door.percyhendrux123.workers.dev/mcp. Deploy Axiom's
 agents sign with the key published at https://deployaxiom.com/.well-known/http-message-signatures-directory.

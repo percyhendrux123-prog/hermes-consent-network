@@ -832,10 +832,8 @@ def well_known_url(domain: str) -> str:
 
 # ------------------------------------------------------------------------------ signed receipts
 def receipt_payload(receipt: Mapping[str, Any]) -> bytes:
-    """What a door signs: the receipt's own chain hash plus the fields a caller relies on."""
-    keep = {k: receipt.get(k) for k in ("seq", "ts", "ask_id", "ask_type", "decision", "reason", "text_sha256",
-                                        "prev", "hash", "identity", "verified_domain", "request_sig_sha256")
-            if k in receipt}
+    """Sign the full receipt, including its previous chain hash, before sealing this line."""
+    keep = {k: v for k, v in receipt.items() if k not in ("hash", "door_signature")}
     return json.dumps(keep, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -848,13 +846,18 @@ def sign_receipt(key: AgentKey, key_url: str, receipt: Dict[str, Any]) -> Dict[s
 
 def verify_receipt(receipt: Mapping[str, Any], directory_doc: Mapping[str, Any]) -> bool:
     """Caller side: check a receipt the door signed, against the door's published key directory."""
-    ds = receipt.get("door_signature") or {}
-    for jwk in directory_doc.get("keys", []):
+    ds = receipt.get("door_signature")
+    if not isinstance(ds, dict) or ds.get("alg") != "ed25519" or not isinstance(ds.get("sig"), str):
+        return False
+    keys = directory_doc.get("keys") if isinstance(directory_doc, Mapping) else None
+    if not isinstance(keys, list):
+        return False
+    for jwk in keys:
         try:
-            if jwk_thumbprint(jwk) != ds.get("keyid"):
+            if not isinstance(jwk, Mapping) or jwk_thumbprint(jwk) != ds.get("keyid"):
                 continue
             public_key_from_jwk(jwk).verify(b64url_decode(ds["sig"]), receipt_payload(receipt))
             return True
         except (InvalidSignature, ValueError, KeyError, TypeError):
-            return False
+            continue
     return False

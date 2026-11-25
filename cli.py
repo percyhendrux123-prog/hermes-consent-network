@@ -9,7 +9,7 @@ from typing import Any, List
 from . import core
 
 USAGE = ("Usage: consent pending | approve <code> | deny <code> | receipts [--ask ID] [--peer NAME] "
-         "[--last N] [--json] | verify [path] | compare <other receipts.jsonl> | declines | "
+         "[--last N] [--json] | verify [path] | compare <other receipts.jsonl> [--peer-directory <json>] | declines | "
          "forget <decline id> | policy <peer>")
 
 
@@ -30,6 +30,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     c = sub.add_parser("compare", help="Cross-check this side's receipts with the other side's file")
     c.add_argument("other")
     c.add_argument("--mine", default="")
+    c.add_argument("--peer-directory", default="", help="Trusted local JSON public key directory of the peer")
     sub.add_parser("declines", help="Remembered no's")
     f = sub.add_parser("forget", help="Forget one remembered no")
     f.add_argument("decline_id")
@@ -58,6 +59,8 @@ def handle(plugin: Any, args: argparse.Namespace) -> int:
         argv.append(args.other)
         if args.mine:
             argv += ["--mine", args.mine]
+        if args.peer_directory:
+            argv += ["--peer-directory", args.peer_directory]
     elif cmd == "forget":
         argv.append(args.decline_id)
     elif cmd == "policy":
@@ -142,20 +145,35 @@ def run_text(plugin: Any, argv: List[str], via: str = "slash") -> str:
             return "OK: %d receipt(s), hash chain intact (%s)." % (count, path.name)
         return "BROKEN: %d receipt(s), %d problem(s):\n  %s" % (count, len(problems), "\n  ".join(problems[:20]))
     if sub == "compare":
+        usage = "Usage: consent compare <other receipts.jsonl> [--mine <path>] [--peer-directory <json>]"
         if not rest:
-            return "Usage: consent compare <other receipts.jsonl> [--mine <path>]"
+            return usage
         mine_path = Path(_opt(rest, "--mine")) if _opt(rest, "--mine") else plugin.receipts().path
         mine, theirs = core.read_receipts(mine_path), core.read_receipts(Path(rest[0]))
-        lines = []
+        peer_directory = None
+        if "--peer-directory" in rest:
+            directory_path = _opt(rest, "--peer-directory")
+            if not directory_path:
+                return usage
+            try:
+                peer_directory = json.loads(Path(directory_path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return "MISMATCH: could not read the trusted peer key directory."
+            if not isinstance(peer_directory, dict) or not isinstance(peer_directory.get("keys"), list):
+                return "MISMATCH: trusted peer key directory must contain a public keys list."
+        lines, chain_issues = [], []
         for label, recs in (("mine", mine), ("theirs", theirs)):
             ok, count, _ = core.verify_chain(recs)
             lines.append("%s: %d receipt(s), chain %s" % (label, count, "intact" if ok else "BROKEN"))
-        shared, issues = core.compare_sides(mine, theirs)
+            if not ok:
+                chain_issues.append("%s: broken receipt chain (run consent verify on this file)" % label)
+        shared, issues, notes = core.compare_report(mine, theirs, peer_directory=peer_directory)
+        issues += chain_issues
+        notes = ["  note: " + n for n in notes]
         if issues:
-            return "MISMATCH on %d of %d shared ask(s):\n  %s\n%s" % (len(issues), shared, "\n  ".join(issues),
-                                                                    "\n".join(lines))
-        notes = core.compare_notes(mine, theirs)
-        return "\n".join(lines + ["Both sides agree on all %d shared ask(s)." % shared] + ["  note: " + n for n in notes])
+            return "\n".join(["MISMATCH: %d issue(s), %d shared ask(s)." % (len(issues), shared)]
+                             + ["  " + i for i in issues] + lines + notes)
+        return "\n".join(lines + ["Both sides agree on all %d shared ask(s)." % shared] + notes)
     if sub == "declines":
         rows = plugin.declines().active(plugin._expire_days(), plugin._clock())
         if not rows:
