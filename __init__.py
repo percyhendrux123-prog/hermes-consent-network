@@ -181,6 +181,8 @@ class ConsentNetwork:
         if state == "waiting":
             line = "[INPUT_REQUIRED] consent: %s waiting for the owner's approval. Re-send the same ask " \
                    "(same consent-ask id) later to get the answer." % ask_id
+        elif state == "duplicate":
+            line = "consent: %s duplicate (previously allowed; not run again)" % ask_id
         else:
             line = "consent: %s denied (%s)" % (ask_id, why)
         return ("[consent-network ask=%s peer=%s type=%s: %s. The request text was withheld from you by "
@@ -228,6 +230,7 @@ class ConsentNetwork:
             ask_id = core.derived_ask_id(peer, ask_type, body)
         text_sha = core.sha256_text(core.normalize_text(body))
         body_sha = core.sha256_text(body)
+        request_sha = core.sha256_text(body_full)
         summary = core.one_line(body)
         owner = policy.owner if policy else ""
         base = dict(direction="in", ask_id=ask_id, peer=peer, owner=owner, ask_type=ask_type, summary=summary,
@@ -255,29 +258,44 @@ class ConsentNetwork:
         # Check the stored peer, id, type and exact body before consulting an owner's decision.
         pend = self.pending()
         pkey = "%s/%s" % (peer, ask_id)  # ask ids come from peers; never let two peers collide
-        prior = pend.get(pkey)
-        if prior is not None:
-            owner_of = "owner:%s" % (prior.get("owner") or owner)
-            if prior.get("peer") != peer:
-                return deny("ask_id_reused_with_different_peer", "policy")
-            if prior.get("ask_id") != ask_id:
-                return deny("ask_id_record_mismatch", "policy")
-            if prior.get("ask_type") != ask_type:
-                return deny("ask_id_reused_with_different_type", "policy")
-            exact_hash = prior.get("body_sha256")
+
+        def binding_reason(record: Dict[str, Any]) -> str:
+            if record.get("peer") != peer:
+                return "ask_id_reused_with_different_peer"
+            if record.get("ask_id") != ask_id:
+                return "ask_id_record_mismatch"
+            if record.get("ask_type") != ask_type:
+                return "ask_id_reused_with_different_type"
+            if record.get("status") == "allowed":
+                return "" if record.get("request_sha256") == request_sha else "ask_id_reused_with_different_text"
+            exact_hash = record.get("body_sha256")
             if exact_hash is None:
                 # Older entries only retained a prefix. Use it only when it is known to be complete.
-                old_body = prior.get("body")
+                old_body = record.get("body")
                 if not isinstance(old_body, str) or len(old_body) >= 2000:
-                    return deny("ask_id_legacy_binding_unavailable", "policy")
+                    return "ask_id_legacy_binding_unavailable"
                 exact_hash = core.sha256_text(old_body)
-            if prior.get("text_sha256") != text_sha or exact_hash != body_sha:
-                return deny("ask_id_reused_with_different_text", "policy")
+            if record.get("text_sha256") != text_sha or exact_hash != body_sha:
+                return "ask_id_reused_with_different_text"
+            return ""
+
+        def duplicate() -> Dict[str, Any]:
+            self._receipt(event="ask", decision="duplicate", reason="previously_allowed", decided_by="policy", **base)
+            return {"action": "rewrite", "text": self._withheld(ask_id, peer, ask_type, "duplicate", "")}
+
+        prior = pend.get(pkey)
+        if prior is not None and not pend.replay_expired(prior, now):
+            mismatch = binding_reason(prior)
+            if mismatch:
+                return deny(mismatch, "policy")
             status = prior.get("status")
             if ask_type in core.HARD_DENY:
                 return deny("always_denied", "policy")
             if ask_type in policy.deny:
                 return deny("peer_denied", "policy")
+            if status == "allowed":
+                return duplicate()
+            owner_of = "owner:%s" % (prior.get("owner") or owner)
             deadline = float(prior.get("created", 0)) + self._ttl()
             unexpired = now < deadline
             if status == "approved" and unexpired:
@@ -295,9 +313,22 @@ class ConsentNetwork:
             # An expired wait or unused approval is evaluated again against current policy.
 
         decision, reason = policy.decide(ask_type)
+        replay_window = (self._clock, self._ttl())
         if decision == core.DENY:
             return deny(reason, "policy")
         if decision == core.ALLOW:
+            claim = {"ask_id": ask_id, "peer": peer, "ask_type": ask_type, "status": "allowed",
+                     "request_sha256": request_sha}
+            if not pend.replace(pkey, prior, claim, replay_window=replay_window):
+                # Another dispatch won the claim while this one was checking policy.
+                current = pend.get(pkey)
+                if current is not None and not pend.replay_expired(current, self._clock()):
+                    mismatch = binding_reason(current)
+                    if mismatch:
+                        return deny(mismatch, "policy")
+                    if current.get("status") == "allowed":
+                        return duplicate()
+                return deny("ask_state_changed", "policy")
             return allow(reason, "policy")
 
         hit = self.declines().match(peer=peer, ask_type=ask_type, body=body, threshold=self._threshold(),
@@ -319,7 +350,7 @@ class ConsentNetwork:
         record = {"key": pkey, "ask_id": ask_id, "peer": peer, "owner": owner, "ask_type": ask_type, "summary": summary,
                   "body": body[:2000], "text_sha256": text_sha, "body_sha256": body_sha, "code": code, "status": "pending",
                   "created": now, "reason": reason, "previous_codes": prior_codes}
-        if not pend.replace(pkey, prior, record):
+        if not pend.replace(pkey, prior, record, replay_window=replay_window):
             return deny("ask_state_changed", "policy")
         target = policy.notify_to or str(self._cfg("owner_notify_to", "") or "")
         question = ("%s's agent asks (%s): %s\nReply \"consent yes %s\" or \"consent no %s\"."
@@ -367,13 +398,15 @@ class ConsentNetwork:
         try:
             if str(platform or "").lower() != "a2a":
                 return
-            m = core.BANNER_RE.search(_text(user_message))
+            prompt = _text(user_message)
+            m = core.BANNER_RE.search(prompt)
             if not m:
                 return
             reply = _text(assistant_response)
             said = core.REPLY_RE.search(reply)
+            outcome = "duplicate" if prompt.startswith(": DUPLICATE.", m.end()) else "replied"
             self._receipt(event="result", direction="in", ask_id=m.group("id"), peer=m.group("peer"),
-                          ask_type=m.group("type"), result="replied",
+                          ask_type=m.group("type"), result=outcome,
                           detail={"reply_sha256": core.sha256_text(reply), "reply_chars": len(reply),
                                   "reply_said": said.group("decision").lower() if said else ""})
         except Exception as exc:

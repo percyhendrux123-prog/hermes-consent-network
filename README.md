@@ -40,7 +40,7 @@ For every inbound A2A ask, the plugin decides before the model sees anything:
 2. **Always-denied type** (`money`, `payment`, `refund`, `price`, `pricing`, `send_third_party`, `delete_data`) -> denied. No allow-list can open these.
 3. **The owner already answered this exact ask.** The answer is bound to the peer, ask ID, declared type, and exact parsed text. A yes works once within the pending window. A no stays a no. A stored ID cannot be reused for a different type or body.
 4. **On the peer's deny list** -> denied.
-5. **On the peer's allow list** -> allowed.
+5. **On the peer's allow list** -> allowed once per peer and ask ID in the pending window. An identical resend reports `duplicate` and withholds the request. A changed ask using the same ID is denied within the window.
 6. **Anything else** (listed under `ask_owner`, not listed at all, or no `consent-ask` line): first check the remembered no's. A near match (same peer, same type, similar wording) is denied without asking. Otherwise it becomes one question to the owner. A peer can have at most `max_pending` (default 3) questions open at once.
 
 When an ask is denied or waiting, the model gets a short notice and **not the request text**. It can't act on what it never saw. When the plugin itself errors on an A2A ask, it denies. Everywhere else it fails open, like its sibling plugins.
@@ -101,7 +101,7 @@ Under `plugins.entries.hermes-consent-network.settings`:
 | `peers_dir` | `<state_dir>/peers` | one `<peer>.yaml` per peer |
 | `owner_notify_to` | none | `hermes send` target when a policy has no `notify_to` |
 | `owner_ids` | none | `platform:user_id` entries allowed to answer from chat |
-| `pending_ttl_hours` | 24 | an unanswered ask is asked again after this |
+| `pending_ttl_hours` | 24 | lifetime of a pending or unused approved ask, and the allow-list duplicate window |
 | `remember_no_days` | 30 | how long a no holds; 0 turns it off |
 | `similarity` | 0.6 | how close new wording must be to a declined ask to count as the same |
 | `require_outbound_header` | true | block outbound asks with no `consent-ask` line |
@@ -131,6 +131,7 @@ The pattern already runs between two real Hermes installs: an operator's agent a
 
 - Covers A2A asks that reach the gateway's normal inbound path (`pre_gateway_dispatch`). A2A agents served for another profile through `forward_to_owner` skip that hook today. That path is not covered (checked against source; not run live).
 - Approval comes back on the peer's next send of the same ask within `pending_ttl_hours`. After expiry, the ask is evaluated against current policy again. There is no push to the waiting peer yet. An older stored approval cannot release the ask if the original body may have been truncated; use a new ask ID.
+- Allow-list deduplication lasts only for `pending_ttl_hours` and depends on keeping the local state file. Within the window, `duplicate` means “previously allowed,” not “work completed.” The plugin withholds the request and does not cache or repeat the model's reply. After the window an ask can be evaluated again.
 - A signed peer export requires a trusted local copy of that peer's public key directory. `compare` does not discover keys or fetch receipt-supplied URLs; unsigned receipts remain usable but do not authenticate the peer. Compare uses the latest substantive reply for each ID and reports ambiguous or nonreciprocal IDs rather than merging them. Use fresh IDs for new exchanges. Older exports may have hashed the caller's transport header along with the reply, causing a mismatch.
 - Ask types are declared by the asking agent. The plugin trusts the peer's identity (from A2A credentials), not its labels. That's why unknown and unlabeled asks go to the owner and labels can't open hard-denied types. A peer that mislabels a pricing ask as `status_question` gets an allowed status question. The model is told to do only what that type needs, and the receipt records the label it used.
 - Not installed in any live profile. `hermes plugins validate` passes. The `hermes consent` CLI registration was checked by validate and unit test, not run from an installed copy.

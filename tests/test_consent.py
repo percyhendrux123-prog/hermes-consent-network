@@ -122,6 +122,89 @@ class TestAllow(Base):
                              source=SimpleNamespace(platform="a2a", user_id="bob-agent"))
         self.assertIn("ALLOWED", self.p.pre_gateway_dispatch(event=ev)["text"])
 
+    def test_identical_allow_list_resend_is_duplicate_after_restart(self):
+        body = "Is the public spring menu live yet?"
+        ask = ("status_question", "REPEAT01", body)
+        self.assertIn(body, self.ask(*ask)["text"])
+        self.p = plugin_mod.ConsentNetwork(self.cfg.get, profile="alice-agent", notifier=self.notify, clock=self.clock)
+        out = self.ask(*ask)["text"]
+        self.assertNotIn(body, out)
+        self.assertIn("consent: REPEAT01 duplicate (previously allowed; not run again)", out)
+        self.assertEqual([r["decision"] for r in self.receipts()], ["allow", "duplicate"])
+        self.assertEqual(self.sent, [])
+
+    def test_allow_list_duplicate_window_expires(self):
+        self.cfg["pending_ttl_hours"] = 1
+        ask = ("status_question", "REPEAT02", "Is the public spring menu live yet?")
+        self.ask(*ask)
+        self.clock.t += 3599
+        self.assertIn("DUPLICATE", self.ask(*ask)["text"])
+        self.clock.t += 1
+        self.assertIn("ALLOWED", self.ask(*ask)["text"])
+
+    def test_duplicate_window_starts_when_the_claim_is_written(self):
+        self.cfg["pending_ttl_hours"] = 1
+        start = self.clock.t
+        claimed = start + 17
+        samples = iter([start, claimed, claimed])
+        self.p._clock = lambda: next(samples)
+        self.ask("status_question", "REPEAT06", "Is the public catalog online?")
+        record = self.p.pending().get("bob-agent/REPEAT06")
+        self.assertEqual(record["expires_at"], claimed + 3600)
+
+    def test_unreadable_pending_state_holds_the_ask_and_retains_the_file(self):
+        path = self.dir / "pending.json"
+        body = "Is the public catalog online?"
+        for bad in ("{", '{"asks": []}', '{"asks": {"bob-agent/REPEAT07": null}}'):
+            with self.subTest(state=bad):
+                path.write_text(bad, encoding="utf-8")
+                out = self.ask("status_question", "REPEAT07", body)["text"]
+                self.assertIn("consent check failed", out)
+                self.assertNotIn(body, out)
+                self.assertEqual(path.read_text(encoding="utf-8"), bad)
+
+    def test_allow_list_replay_binds_each_peer_and_exact_request(self):
+        (self.dir / "peers" / "carol-agent.yaml").write_text(POLICY.replace("bob-agent", "carol-agent"))
+        ask = ("status_question", "REPEAT03", "Is the public spring menu live yet?")
+        self.ask(*ask)
+        changed = ask[-1] + " "
+        out = self.ask(*ask[:2], changed)["text"]
+        self.assertIn("ask_id_reused_with_different_text", out)
+        self.assertNotIn(ask[-1], out)
+        self.assertNotIn("body", self.p.pending().get("bob-agent/REPEAT03"))
+        self.assertIn("ALLOWED", self.ask(*ask, peer="carol-agent")["text"])
+
+    def test_overlapping_allow_list_dispatches_share_one_claim(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        barrier = Barrier(2)
+        pending = self.p.pending()
+        read = pending.get
+
+        def synchronized_first_read(key):
+            row = read(key)
+            if row is None:
+                barrier.wait(timeout=5)
+            return row
+
+        pending.get = synchronized_first_read
+        self.p.pending = lambda: pending
+        ask = ("status_question", "REPEAT04", "Is the public spring menu live yet?")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.ask(*ask)["text"], range(2)))
+        self.assertEqual(sum(ask[-1] in text for text in results), 1)
+        self.assertEqual(sum("DUPLICATE" in text for text in results), 1)
+
+    def test_duplicate_notice_does_not_replace_the_original_reply_in_comparison(self):
+        ask = ("status_question", "REPEAT05", "Is the public spring menu live yet?")
+        self.p.post_llm_call(user_message=self.ask(*ask)["text"],
+                             assistant_response="consent: REPEAT05 allowed\nYes.", platform="a2a")
+        original = core.final_decisions(self.receipts())[ask[1]]["reply_sha256"]
+        prompt = self.ask(*ask)["text"]
+        self.p.post_llm_call(user_message=prompt, assistant_response=prompt.splitlines()[-1], platform="a2a")
+        self.assertEqual(core.final_decisions(self.receipts())[ask[1]]["reply_sha256"], original)
+
     def test_non_a2a_traffic_untouched(self):
         self.assertIsNone(self.p.pre_gateway_dispatch(event=chat_event("telegram", "someone", "hello")))
         self.assertEqual(self.receipts(), [])

@@ -36,7 +36,7 @@ _TYPE_OK = re.compile(r"^[a-z0-9][a-z0-9_]{0,47}$")
 ASK_RE = re.compile(r"^[ \t]*\[?consent-ask[ \t]*:?[ \t]*(?P<type>[A-Za-z0-9_.-]+)"
                     r"(?:[ \t]+id=(?P<id>[A-Za-z0-9_-]{4,64}))?[ \t]*\]?[ \t]*$", re.M | re.I)
 # The line a receiving agent is told to start its reply with.
-REPLY_RE = re.compile(r"consent:[ \t]*(?P<id>[A-Za-z0-9_-]{4,64})[ \t]+(?P<decision>allowed|denied|waiting)",
+REPLY_RE = re.compile(r"consent:[ \t]*(?P<id>[A-Za-z0-9_-]{4,64})[ \t]+(?P<decision>allowed|denied|waiting|duplicate)\b",
                       re.I)
 # Owner answer through any chat surface: "consent yes K7Q2XM" / "consent no K7Q2XM".
 ANSWER_RE = re.compile(r"^\s*consent\s+(?P<answer>yes|no|approve|deny)\s+(?P<code>[A-Za-z0-9]{6})\s*[.!]?\s*$",
@@ -301,9 +301,10 @@ class _FileLock:
 class JsonState:
     """A dict in one 0600 JSON file, read-modify-written under an flock."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, validate: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.path = Path(path)
         self.lock = self.path.with_suffix(".lock")
+        self.validate = validate
 
     def _read(self) -> Dict[str, Any]:
         if self.path.is_symlink():
@@ -314,13 +315,21 @@ class JsonState:
         except FileNotFoundError:
             return {}
         except (ValueError, OSError):
+            if self.validate is not None:
+                raise
             bad = "%s.corrupt-%d" % (self.path, int(time.time()))
             try:
                 os.replace(self.path, bad)
             except OSError:
                 pass
             return {}
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            if self.validate is not None:
+                self.validate(data)
+            return data
+        if self.validate is not None:
+            raise ValueError("state must be an object")
+        return {}
 
     def _write(self, data: Dict[str, Any]) -> None:
         tmp = "%s.tmp-%s" % (self.path, uuid.uuid4().hex[:8])
@@ -351,10 +360,26 @@ class JsonState:
 
 
 class Pending:
-    """Asks waiting on (or answered by) the owner, keyed by ask id."""
+    """Owner decisions and short-lived allow-list claims, keyed by peer and ask ID."""
 
     def __init__(self, state_dir: Path):
-        self.state = JsonState(Path(state_dir) / "pending.json")
+        self.state = JsonState(Path(state_dir) / "pending.json", validate=self._validate)
+
+    @staticmethod
+    def _validate(data: Dict[str, Any]) -> None:
+        asks = data.get("asks", {})
+        if not isinstance(asks, dict):
+            raise ValueError("pending asks must be an object")
+        for rec in asks.values():
+            if not isinstance(rec, dict) or rec.get("status") not in ("pending", "approved", "declined", "used", "allowed"):
+                raise ValueError("malformed pending record")
+            if any(not isinstance(rec.get(field), str) for field in ("peer", "ask_id", "ask_type")):
+                raise ValueError("malformed pending binding")
+            if rec["status"] == "allowed":
+                if type(rec.get("expires_at")) not in (int, float) or not isinstance(rec.get("request_sha256"), str):
+                    raise ValueError("malformed allow-list claim")
+            elif type(rec.get("created")) not in (int, float) or not isinstance(rec.get("code"), str):
+                raise ValueError("malformed pending owner decision")
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         return (self.state.read().get("asks") or {}).get(key)
@@ -374,14 +399,31 @@ class Pending:
             return rec
         return self.state.update(fn)
 
+    @staticmethod
+    def replay_expired(rec: Dict[str, Any], now: float) -> bool:
+        return rec.get("status") == "allowed" and now >= rec["expires_at"]
+
     def replace(self, key: str, before: Optional[Dict[str, Any]], after: Dict[str, Any], *,
+                replay_window: Optional[Tuple[Callable[[], float], float]] = None,
                 guard: Optional[Callable[[], bool]] = None) -> bool:
         """Commit a decision only if the record inspected by the caller is still current."""
         def fn(data):
             asks = data.setdefault("asks", {})
-            if asks.get(key) != before or (guard is not None and not guard()):
+            expected = before
+            replacement = after
+            if replay_window is not None:
+                clock, ttl = replay_window
+                prune_at = clock()
+                for old_key, old in list(asks.items()):
+                    if self.replay_expired(old, prune_at):
+                        del asks[old_key]
+                if expected is not None and self.replay_expired(expected, prune_at):
+                    expected = None
+                if after.get("status") == "allowed":
+                    replacement = dict(after, expires_at=prune_at + ttl)
+            if asks.get(key) != expected or (guard is not None and not guard()):
                 return False
-            asks[key] = after
+            asks[key] = replacement
             return True
         return self.state.update(fn)
 
@@ -566,14 +608,16 @@ def final_decisions(records: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, An
             if peer_decision:
                 cur["decision"] = peer_decision
             reply_sha = r["detail"].get("reply_sha256")
-            if reply_sha:
+            # A duplicate acknowledges the original decision; it isn't a new answer to the ask.
+            if reply_sha and r.get("result") != "duplicate" and peer_decision != "duplicate":
                 cur["reply_sha256"] = reply_sha
                 cur["reply_phase"] = _SAME.get(peer_decision or r["detail"].get("reply_said"), "")
     return out
 
 
 # Both sides' words for the same outcome.
-_SAME = {"allow": "allowed", "allowed": "allowed", "approved": "allowed", "deny": "denied", "denied": "denied",
+_SAME = {"allow": "allowed", "allowed": "allowed", "approved": "allowed", "duplicate": "allowed",
+         "deny": "denied", "denied": "denied",
          "declined": "denied", "remembered_no": "denied", "ask_owner": "waiting", "waiting": "waiting"}
 
 

@@ -31,7 +31,7 @@ config_schema:
   pending_ttl_hours:
     type: float
     default: 24
-    description: Hours an unanswered ask waits before it is asked again.
+    description: Hours before a pending or unused approved ask expires; also the allow-list duplicate window.
   remember_no_days:
     type: float
     default: 30
