@@ -133,6 +133,22 @@ class TestAllow(Base):
         self.assertEqual([r["decision"] for r in self.receipts()], ["allow", "duplicate"])
         self.assertEqual(self.sent, [])
 
+    def test_identical_idless_allow_list_resend_needs_fresh_id(self):
+        body = "Is the public spring menu live yet?"
+        message = "consent-ask: status_question\n" + body
+        first = self.p.pre_gateway_dispatch(event=a2a_event("bob-agent", message))["text"]
+        self.assertIn("ALLOWED (allow-list)", first)
+        self.assertIn(body, first)
+
+        repeat = self.p.pre_gateway_dispatch(event=a2a_event("bob-agent", message))["text"]
+        self.assertIn("DUPLICATE", repeat)
+        self.assertNotIn(body, repeat)
+
+        fresh = self.ask("status_question", "REPEAT08", body)["text"]
+        self.assertIn("ALLOWED (allow-list)", fresh)
+        self.assertIn(body, fresh)
+        self.assertEqual([r["decision"] for r in self.receipts()], ["allow", "duplicate", "allow"])
+
     def test_allow_list_duplicate_window_expires(self):
         self.cfg["pending_ttl_hours"] = 1
         ask = ("status_question", "REPEAT02", "Is the public spring menu live yet?")
