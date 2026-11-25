@@ -94,10 +94,10 @@ def new_ask_id() -> str:
     return secrets.token_hex(4).upper()
 
 
-def owner_code(ask_id: str, peer: str) -> str:
-    """Six characters the owner types back. Derived, so a resend maps to the same code."""
+def owner_code(ask_id: str, peer: str, *, generation: str) -> str:
+    """Six characters for this pending generation, not for all resends of this ask."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    digest = hashlib.sha256(("%s\0%s" % (peer, ask_id)).encode()).digest()
+    digest = hashlib.sha256(("%s\0%s\0%s" % (peer, ask_id, generation)).encode()).digest()
     return "".join(alphabet[b % len(alphabet)] for b in digest[:6])
 
 
@@ -366,23 +366,23 @@ class Pending:
         return sum(1 for r in self.all() if r.get("peer") == peer and r.get("status") == "pending"
                    and now - float(r.get("created", 0)) < ttl)
 
-    def create(self, rec: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-        """(record, created). An existing record for the same ask id is returned untouched."""
-        def fn(data):
-            asks = data.setdefault("asks", {})
-            key = rec.get("key") or rec["ask_id"]
-            if key in asks:
-                return asks[key], False
-            asks[key] = rec
-            return rec, True
-        return self.state.update(fn)
-
     def set(self, _key: str, **fields: Any) -> Optional[Dict[str, Any]]:
         def fn(data):
             rec = (data.get("asks") or {}).get(_key)
             if rec is not None:
                 rec.update(fields)
             return rec
+        return self.state.update(fn)
+
+    def replace(self, key: str, before: Optional[Dict[str, Any]], after: Dict[str, Any], *,
+                guard: Optional[Callable[[], bool]] = None) -> bool:
+        """Commit a decision only if the record inspected by the caller is still current."""
+        def fn(data):
+            asks = data.setdefault("asks", {})
+            if asks.get(key) != before or (guard is not None and not guard()):
+                return False
+            asks[key] = after
+            return True
         return self.state.update(fn)
 
     def by_code(self, code: str) -> Optional[Dict[str, Any]]:

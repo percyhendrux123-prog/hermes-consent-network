@@ -219,6 +219,7 @@ class ConsentNetwork:
         if not ask_id:
             ask_id = core.derived_ask_id(peer, ask_type, body)
         text_sha = core.sha256_text(core.normalize_text(body))
+        body_sha = core.sha256_text(body)
         summary = core.one_line(body)
         owner = policy.owner if policy else ""
         base = dict(direction="in", ask_id=ask_id, peer=peer, owner=owner, ask_type=ask_type, summary=summary,
@@ -243,30 +244,47 @@ class ConsentNetwork:
             return deny("needs_%s" % need, "identity")
 
         # An answer the owner already gave to this exact ask wins over everything except the hard floor.
-        # The answer is bound to the ask's text hash: a peer cannot reuse an approved id for new words.
+        # Check the stored peer, id, type and exact body before consulting an owner's decision.
         pend = self.pending()
         pkey = "%s/%s" % (peer, ask_id)  # ask ids come from peers; never let two peers collide
         prior = pend.get(pkey)
         if prior is not None:
             owner_of = "owner:%s" % (prior.get("owner") or owner)
-            if prior.get("peer") != peer or prior.get("text_sha256") != text_sha:
+            if prior.get("peer") != peer:
+                return deny("ask_id_reused_with_different_peer", "policy")
+            if prior.get("ask_id") != ask_id:
+                return deny("ask_id_record_mismatch", "policy")
+            if prior.get("ask_type") != ask_type:
+                return deny("ask_id_reused_with_different_type", "policy")
+            exact_hash = prior.get("body_sha256")
+            if exact_hash is None:
+                # Older entries only retained a prefix. Use it only when it is known to be complete.
+                old_body = prior.get("body")
+                if not isinstance(old_body, str) or len(old_body) >= 2000:
+                    return deny("ask_id_legacy_binding_unavailable", "policy")
+                exact_hash = core.sha256_text(old_body)
+            if prior.get("text_sha256") != text_sha or exact_hash != body_sha:
                 return deny("ask_id_reused_with_different_text", "policy")
             status = prior.get("status")
             if ask_type in core.HARD_DENY:
                 return deny("always_denied", "policy")
             if ask_type in policy.deny:
                 return deny("peer_denied", "policy")
-            if status == "approved":
-                pend.set(pkey, status="used", used_at=now)
+            deadline = float(prior.get("created", 0)) + self._ttl()
+            unexpired = now < deadline
+            if status == "approved" and unexpired:
+                if not pend.replace(pkey, prior, dict(prior, status="used", used_at=now),
+                                    guard=lambda: self._clock() < deadline):
+                    return deny("ask_state_changed", "policy")
                 return allow("owner_approved", owner_of)
             if status == "declined":
                 return deny("owner_declined", owner_of)
             if status == "used":
                 return deny("approval_already_used", "policy")
-            if status == "pending" and now - float(prior.get("created", 0)) < self._ttl():
+            if status == "pending" and unexpired:
                 self._receipt(event="ask", decision="ask_owner", reason="still_waiting", decided_by="policy", **base)
                 return {"action": "rewrite", "text": self._withheld(ask_id, peer, ask_type, "waiting", "")}
-            # an expired wait falls through and is asked again
+            # An expired wait or unused approval is evaluated again against current policy.
 
         decision, reason = policy.decide(ask_type)
         if decision == core.DENY:
@@ -282,14 +300,19 @@ class ConsentNetwork:
         if pend.open_for_peer(peer, now, self._ttl()) >= policy.max_pending:
             return deny("too_many_open_asks", "policy")
 
-        code = core.owner_code(ask_id, peer)
+        prior_codes = list(prior.get("previous_codes", [])) if prior else []
+        if prior and prior.get("code"):
+            prior_codes.append(prior["code"])
+        generation = repr(now)
+        code = core.owner_code(ask_id, peer, generation=generation)
+        while code in prior_codes:
+            generation += "+"
+            code = core.owner_code(ask_id, peer, generation=generation)
         record = {"key": pkey, "ask_id": ask_id, "peer": peer, "owner": owner, "ask_type": ask_type, "summary": summary,
-                  "body": body[:2000], "text_sha256": text_sha, "code": code, "status": "pending",
-                  "created": now, "reason": reason}
-        if prior is None:
-            pend.create(record)
-        else:
-            pend.set(pkey, **record)
+                  "body": body[:2000], "text_sha256": text_sha, "body_sha256": body_sha, "code": code, "status": "pending",
+                  "created": now, "reason": reason, "previous_codes": prior_codes}
+        if not pend.replace(pkey, prior, record):
+            return deny("ask_state_changed", "policy")
         target = policy.notify_to or str(self._cfg("owner_notify_to", "") or "")
         question = ("%s's agent asks (%s): %s\nReply \"consent yes %s\" or \"consent no %s\"."
                     % (peer, ask_type, core.one_line(body, 200), code, code))
@@ -312,8 +335,13 @@ class ConsentNetwork:
         if rec.get("status") != "pending":
             return "Ask %s was already answered (%s)." % (rec["ask_id"], rec.get("status"))
         now = self._clock()
+        deadline = float(rec.get("created", 0)) + self._ttl()
+        if now >= deadline:
+            return "Ask %s expired. The peer can send it again." % rec["ask_id"]
         status = "approved" if yes else "declined"
-        pend.set(rec.get("key") or rec["ask_id"], status=status, decided_at=now, decided_via=via)
+        if not pend.replace(rec.get("key") or rec["ask_id"], rec, dict(rec, status=status, decided_at=now, decided_via=via),
+                            guard=lambda: self._clock() < deadline):
+            return "Ask %s changed while you were answering. Check /consent pending." % rec["ask_id"]
         if not yes:
             self.declines().add(peer=rec["peer"], ask_type=rec["ask_type"], body=rec.get("body", ""),
                                 ask_id=rec["ask_id"], owner=rec.get("owner", ""), now=now)

@@ -68,7 +68,7 @@ class Base(unittest.TestCase):
         return core.read_receipts(self.dir / "receipts.jsonl")
 
     def code_for(self, ask_id, peer="bob-agent"):
-        return core.owner_code(ask_id, peer)
+        return self.p.pending().get(f"{peer}/{ask_id}")["code"]
 
 
 class TestParsing(Base):
@@ -216,6 +216,39 @@ class TestRouteToOwner(Base):
         out = self.ask("calendar_hold", "BBBB0005", "Hold every Friday for the next year.")
         self.assertIn("ask_id_reused_with_different_text", out["text"])
 
+    def test_owner_approval_is_scoped_to_the_declared_type(self):
+        body = "Is the public event calendar up to date?"
+        self.ask("calendar_review", "BIND0001", body)
+        self.assertTrue(self.p.answer(self.code_for("BIND0001"), True).startswith("Approved"))
+        denied = self.ask("calendar_summary", "BIND0001", body)
+        self.assertNotIn(body, denied["text"])
+        self.assertEqual(self.receipts()[-1]["reason"], "ask_id_reused_with_different_type")
+        self.assertIn(body, self.ask("calendar_review", "BIND0001", body)["text"])
+
+    def test_exact_body_is_bound_even_when_audit_hash_is_normalized(self):
+        self.ask("calendar_review", "BIND0002", "Can I read the Alpha calendar?")
+        self.p.answer(self.code_for("BIND0002"), True)
+        out = self.ask("calendar_review", "BIND0002", "Can I read the alpha calendar?")
+        self.assertIn("ask_id_reused_with_different_text", out["text"])
+
+    def test_unused_approval_expires_with_its_request(self):
+        self.ask("calendar_hold", "BIND0003", self.BODY)
+        self.p.answer(self.code_for("BIND0003"), True)
+        self.clock.t += 24 * 3600
+        out = self.ask("calendar_hold", "BIND0003", self.BODY)
+        self.assertIn("waiting", out["text"])
+        self.assertNotIn(self.BODY, out["text"])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_approval_must_be_live_at_the_claim(self):
+        self.ask("calendar_hold", "BIND0004", self.BODY)
+        self.p.answer(self.code_for("BIND0004"), True)
+        deadline = self.clock.t + 24 * 3600
+        samples = iter([deadline - 1, deadline, deadline])
+        self.p._clock = lambda: next(samples)
+        self.assertNotIn(self.BODY, self.ask("calendar_hold", "BIND0004", self.BODY)["text"])
+        self.assertEqual(self.p.pending().get("bob-agent/BIND0004")["status"], "approved")
+
     def test_two_peers_same_id_do_not_collide(self):
         (self.dir / "peers" / "carol-agent.yaml").write_text(POLICY.replace("bob-agent", "carol-agent"))
         self.ask("calendar_hold", "SAME0001", self.BODY)
@@ -232,9 +265,23 @@ class TestRouteToOwner(Base):
 
     def test_expired_wait_asks_again(self):
         self.ask("calendar_hold", "BBBB0006", self.BODY)
+        first_code = self.code_for("BBBB0006")
         self.clock.t += 25 * 3600
         self.ask("calendar_hold", "BBBB0006", self.BODY)
         self.assertEqual(len(self.sent), 2)
+        self.assertNotEqual(first_code, self.code_for("BBBB0006"))
+        self.assertTrue(self.p.answer(first_code, True).startswith("No waiting ask"))
+
+    def test_owner_prompt_generation_does_not_reissue_older_codes(self):
+        from unittest.mock import patch
+
+        ask = ("calendar_hold", "BIND0005", self.BODY)
+        with patch.object(core, "owner_code", side_effect=["FIRST1", "SECOND", "FIRST1", "THIRD3"]):
+            for _ in range(3):
+                self.assertIn("waiting", self.ask(*ask)["text"])
+                self.clock.t += 24 * 3600
+        self.assertEqual(self.code_for("BIND0005"), "THIRD3")
+        self.assertTrue(self.p.answer("FIRST1", True).startswith("No waiting ask"))
 
     def test_notify_failure_recorded_and_ask_still_waits(self):
         self.p._notify = lambda t, x: False

@@ -150,7 +150,7 @@ def run(work, out_dir):
     bob_asks("calendar_hold", "H4T8K2D6", "Please hold Thursday 2 PM for my team's tasting, 6 people.")
     say("  alice runs: hermes consent pending")
     say("    " + cli.run_text(alice, ["pending"]).replace("\n", "\n    "))
-    owner_replies("telegram:alice-chat", "consent yes %s" % core.owner_code("H4T8K2D6", "bob-agent"))
+    owner_replies("telegram:alice-chat", "consent yes %s" % alice.pending().get("bob-agent/H4T8K2D6")["code"])
     say("  bob-agent re-sends the same ask (same id):")
     bob_asks("calendar_hold", "H4T8K2D6", "Please hold Thursday 2 PM for my team's tasting, 6 people.")
 
@@ -162,7 +162,7 @@ def run(work, out_dir):
 
     say("\n== 4. A no is remembered (newsletter_feature is not listed, so it goes to alice) ==")
     bob_asks("newsletter_feature", "N2F5W7J4", "Feature our new sourdough in your Friday newsletter?")
-    owner_replies("telegram:alice-chat", "consent no %s" % core.owner_code("N2F5W7J4", "bob-agent"))
+    owner_replies("telegram:alice-chat", "consent no %s" % alice.pending().get("bob-agent/N2F5W7J4")["code"])
     say("  a week later bob-agent asks again with new wording and a new id:")
     clock.t += 7 * 86400
     bob_asks("newsletter_feature", "N9G3Z1K8", "Could you feature our new sourdough in the Friday newsletter?")

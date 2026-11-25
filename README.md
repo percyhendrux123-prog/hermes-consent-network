@@ -38,7 +38,7 @@ For every inbound A2A ask, the plugin decides before the model sees anything:
 
 1. **No policy file for this peer** -> denied. Nobody is asked.
 2. **Always-denied type** (`money`, `payment`, `refund`, `price`, `pricing`, `send_third_party`, `delete_data`) -> denied. No allow-list can open these.
-3. **The owner already answered this exact ask.** The answer is bound to the peer, the ask id and the text hash. A yes works once. A no stays a no. Re-using an id with different words is denied.
+3. **The owner already answered this exact ask.** The answer is bound to the peer, ask ID, declared type, and exact parsed text. A yes works once within the pending window. A no stays a no. A stored ID cannot be reused for a different type or body.
 4. **On the peer's deny list** -> denied.
 5. **On the peer's allow list** -> allowed.
 6. **Anything else** (listed under `ask_owner`, not listed at all, or no `consent-ask` line): first check the remembered no's. A near match (same peer, same type, similar wording) is denied without asking. Otherwise it becomes one question to the owner. A peer can have at most `max_pending` (default 3) questions open at once.
@@ -128,7 +128,7 @@ The pattern already runs between two real Hermes installs: an operator's agent a
 ## Known limits
 
 - Covers A2A asks that reach the gateway's normal inbound path (`pre_gateway_dispatch`). A2A agents served for another profile through `forward_to_owner` skip that hook today. That path is not covered (checked against source; not run live).
-- Approval comes back on the peer's next send of the same ask. There is no push to the waiting peer yet.
+- Approval comes back on the peer's next send of the same ask within `pending_ttl_hours`. After expiry, the ask is evaluated against current policy again. There is no push to the waiting peer yet. An older stored approval cannot release the ask if the original body may have been truncated; use a new ask ID.
 - Ask types are declared by the asking agent. The plugin trusts the peer's identity (from A2A credentials), not its labels. That's why unknown and unlabeled asks go to the owner and labels can't open hard-denied types. A peer that mislabels a pricing ask as `status_question` gets an allowed status question. The model is told to do only what that type needs, and the receipt records the label it used.
 - Not installed in any live profile. `hermes plugins validate` passes. The `hermes consent` CLI registration was checked by validate and unit test, not run from an installed copy.
 
